@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * talon_module_watch.c — Hafta 1: kallsyms tabanlı ham modül listesi okuma
+ *
+ * NE YAPAR:
+ *   Kernel'in kendi ic linked list'i olan "modules" (struct list_head)
+ *   uzerinde list_for_each_entry ile yururek yuklu her modulun adini
+ *   /proc/talon_modules altinda raporlar.
+ *
+ * NEDEN "HAM" OKUMA:
+ *   kernel/module/main.c icindeki "modules" listesi, /proc/modules'in de
+ *   kaynagi. Biz bu listeyi procfs katmanini (seq_file, /proc/modules
+ *   handler'i) atlayip DOGRUDAN bellekten okuyoruz. Boylece:
+ *     - /proc/modules ciktisini degistiren bir userspace/VFS hook'unu
+ *       (LD_PRELOAD, syscall hijack, procfs handler patch) yakalariz.
+ *
+ * SINIRLAMA (ONEMLI):
+ *   Titan-Rootkit gibi klasik DKOM saldirilari modulu bu AYNI listeden
+ *   sokuyor (list_del(&mod->list)). Bu durumda hem /proc/modules hem bu
+ *   modul ayni (artik eksik) listeyi okudugu icin FARK GORULMEZ.
+ *   Bu, bilinen bir sinirlamadir; tam unlink-DKOM tespiti icin ikinci,
+ *   bagimsiz bir kaynak (kobject/sysfs veya mod_tree) gerekir — bu
+ *   sonraki iterasyonda eklenecek (bkz. docs/DETECTION.md).
+ *
+ * TEKNIK NOT — kallsyms_lookup_name:
+ *   Kernel 5.7+ itibariyle kallsyms_lookup_name() modullere export
+ *   edilmiyor. Adresini bulmak icin standart kprobe trick'i kullanilir:
+ *   register_kprobe() ile fonksiyona bir kprobe koyup kp.addr'i okuruz,
+ *   sonra kprobe'u hemen kaldiririz (calistirmadan, sadece adres icin).
+ */
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/kprobes.h>
+#include <linux/list.h>
+#include <linux/slab.h>
+
+#define TALON_MODULES_PROC "talon_modules"
+
+/* struct module icindeki "list" alaniyla ayni layout'u kullanan minimal
+ * bir gorunum. Gercek struct module cok daha buyuk ve kernel versiyonuna
+ * gore degisir; biz sadece list_head ve name alanina erisecegimiz icin
+ * <linux/module.h> uzerinden gelen tam tanimi kullaniyoruz. */
+
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+static kallsyms_lookup_name_t talon_kallsyms_lookup_name;
+
+static struct kprobe talon_kp = {
+	.symbol_name = "kallsyms_lookup_name"
+};
+
+static struct list_head *talon_modules_head;
+static struct proc_dir_entry *talon_modules_proc_entry;
+
+/* --------------------------------------------------------------------
+ * kallsyms_lookup_name adresini kprobe ile cozme
+ * -------------------------------------------------------------------- */
+static int talon_resolve_kallsyms(void)
+{
+	int ret;
+
+	ret = register_kprobe(&talon_kp);
+	if (ret < 0) {
+		pr_err("talon_module_watch: kprobe register basarisiz (%d)\n", ret);
+		return ret;
+	}
+
+	talon_kallsyms_lookup_name = (kallsyms_lookup_name_t)talon_kp.addr;
+	unregister_kprobe(&talon_kp);
+
+	if (!talon_kallsyms_lookup_name) {
+		pr_err("talon_module_watch: kallsyms_lookup_name adresi bulunamadi\n");
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
+/* --------------------------------------------------------------------
+ * "modules" list_head adresini bulma
+ * -------------------------------------------------------------------- */
+static int talon_resolve_modules_list(void)
+{
+	unsigned long addr;
+
+	addr = talon_kallsyms_lookup_name("modules");
+	if (!addr) {
+		pr_err("talon_module_watch: 'modules' sembolu bulunamadi "
+		       "(CONFIG_KALLSYMS_ALL kapali olabilir)\n");
+		return -ENOENT;
+	}
+
+	talon_modules_head = (struct list_head *)addr;
+	pr_info("talon_module_watch: 'modules' listesi bulundu: %px\n",
+		(void *)talon_modules_head);
+	return 0;
+}
+
+/* --------------------------------------------------------------------
+ * /proc/talon_modules — raw modul listesini dokumlemek icin
+ * -------------------------------------------------------------------- */
+static int talon_modules_show(struct seq_file *m, void *v)
+{
+	struct module *mod;
+	int count = 0;
+
+	if (!talon_modules_head) {
+		seq_printf(m, "talon: modules list henuz cozulmedi\n");
+		return 0;
+	}
+
+	list_for_each_entry(mod, talon_modules_head, list) {
+		seq_printf(m, "%s\n", mod->name);
+		count++;
+	}
+
+	seq_printf(m, "# toplam: %d modul (talon raw walk)\n", count);
+	return 0;
+}
+
+static int talon_modules_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, talon_modules_show, NULL);
+}
+
+static const struct proc_ops talon_modules_fops = {
+	.proc_open    = talon_modules_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+/* --------------------------------------------------------------------
+ * modul init / exit
+ * -------------------------------------------------------------------- */
+static int __init talon_module_watch_init(void)
+{
+	int ret;
+
+	ret = talon_resolve_kallsyms();
+	if (ret)
+		return ret;
+
+	ret = talon_resolve_modules_list();
+	if (ret)
+		return ret;
+
+	talon_modules_proc_entry = proc_create(TALON_MODULES_PROC, 0444, NULL,
+						&talon_modules_fops);
+	if (!talon_modules_proc_entry) {
+		pr_err("talon_module_watch: /proc/%s olusturulamadi\n",
+		       TALON_MODULES_PROC);
+		return -ENOMEM;
+	}
+
+	pr_info("talon_module_watch: yuklendi, /proc/%s hazir\n",
+		TALON_MODULES_PROC);
+	return 0;
+}
+
+static void __exit talon_module_watch_exit(void)
+{
+	proc_remove(talon_modules_proc_entry);
+	pr_info("talon_module_watch: kaldirildi\n");
+}
+
+module_init(talon_module_watch_init);
+module_exit(talon_module_watch_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("egetones");
+MODULE_DESCRIPTION("Talon EDR - module_watch (kallsyms raw module list)");
+MODULE_VERSION("0.1");
